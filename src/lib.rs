@@ -9,7 +9,11 @@ extern crate base64;
 extern crate bytes;
 extern crate futures;
 extern crate http;
+extern crate reqwest;
 extern crate url;
+
+#[macro_use]
+extern crate lazy_static;
 
 #[cfg(feature = "jwt")]
 extern crate jsonwebtoken;
@@ -24,17 +28,19 @@ extern crate log;
 
 use base64::decode;
 use bytes::Bytes;
-use futures::future::Future;
+use futures::{Future, IntoFuture, Stream};
+use reqwest::async::Decoder;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use std::io::{self, Cursor};
 use std::iter::FromIterator;
-use std::str;
 use std::time::Duration;
+use std::{mem, str};
 
 use actix_web::middleware::{Middleware, Started};
-use actix_web::{client, HttpRequest, Result};
 use actix_web::{HttpMessage, HttpResponse};
+use actix_web::{HttpRequest, Result};
 use http::header;
 
 static HEADER_USER_AGENT_KEY: &str = "User-Agent";
@@ -215,9 +221,9 @@ impl<S> OPARequest<S> for HTTPTokenAuthRequest {
 
 pub struct PolicyVerifier<A, B> {
     url: String,
-    duration: Duration,
     request: Option<A>,
     response: Option<B>,
+    http_client: reqwest::async::Client,
 }
 
 impl<A, B> PolicyVerifier<A, B>
@@ -227,7 +233,11 @@ where
     pub fn build(url: String) -> Self {
         PolicyVerifier {
             url: url,
-            duration: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            http_client: reqwest::async::Client::builder()
+                .connect_timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+                .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+                .build()
+                .unwrap(),
             request: None,
             response: None,
         }
@@ -239,17 +249,23 @@ where
     }
 
     pub fn timeout(mut self, timeout: Duration) -> PolicyVerifier<A, B> {
-        self.duration = timeout;
+        self.http_client = reqwest::async::Client::builder()
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .build()
+            .unwrap();
         self
     }
 
-    pub fn build_request(&self, req: &A) -> client::SendRequest {
-        client::ClientRequest::post(&self.url)
+    pub fn build_request(
+        &self,
+        req: &A,
+    ) -> impl Future<Item = reqwest::async::Response, Error = reqwest::Error> {
+        self.http_client
+            .post(&self.url)
             .header(HEADER_USER_AGENT_KEY, HEADER_USER_AGENT_VALUE)
             .header(header::CONTENT_TYPE, MIMETYPE_JSON)
-            .timeout(self.duration)
             .json(req)
-            .unwrap()
             .send()
     }
 }
@@ -288,25 +304,45 @@ where
             Ok(res) => {
                 let response = self.build_request(res);
                 Ok(Started::Future(Box::new(
-                            response
-                            .from_err()
-                            .and_then(|response| {
-                                debug!("Received response from OPA : {:?}", response);
-                                Ok(response.body())
-                            })
-                            .and_then(|body| {
-                                body.limit(RESPONSE_BODY_SIZE)
-                                    .from_err()
-                                    .and_then(|bytes: Bytes| extract_response::<B>(&bytes))
-                            }))))
+                    response
+                        .from_err()
+                        .and_then(|res| res.error_for_status().into_future())
+                        .and_then(|mut res| {
+                            let body = mem::replace(res.body_mut(), Decoder::empty());
+                            body.concat2()
+                        })
+                        .map_err(|e| {
+                            let e3 = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                            let e2: actix_web::Error = e3.into();
+                            e2
+                        })
+                        .and_then(|body| {
+                            let mut buf = Vec::new();
 
-            },
+                            let mut body = Cursor::new(body);
+                            io::copy(&mut body, &mut buf)
+                                .into_future()
+                                .map_err(|e| {
+                                    let e3 = std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        e.to_string(),
+                                    );
+                                    let e2: actix_web::Error = e3.into();
+                                    e2
+                                })
+                                .map(|_| {
+                                    let buf: Bytes = buf.into();
+                                    buf
+                                })
+                        })
+                        .and_then(|buf| extract_response::<B>(&buf).into_future()),
+                )))
+            }
             Err(err) => {
                 info!("Bad request, finalizing response 401 : {:?}", err);
                 Ok(Started::Response(HttpResponse::Unauthorized().finish()))
             }
         }
-
     }
 }
 
